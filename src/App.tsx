@@ -4,6 +4,8 @@ import { RUSSIAN_ADDRESSES, type RussianAddress } from "./data/addresses";
 import "./App.css";
 
 const apiKey = import.meta.env.VITE_YANDEX_API_KEY ?? "";
+/** When set, route is fetched via this proxy (avoids CORB). Deploy api/route.js to Vercel and set YANDEX_API_KEY there. */
+const routerProxyUrl = (import.meta.env.VITE_ROUTER_PROXY_URL ?? "").replace(/\/$/, "");
 
 const DEFAULT_CENTER: [number, number] = [55.75, 37.62]; // Moscow
 const DEFAULT_ZOOM = 5;
@@ -27,8 +29,22 @@ interface MapWithRouteProps {
   onDistanceChange: (value: string | null) => void;
 }
 
+// Router API response types (from api.routing.yandex.net)
+interface RouterStep {
+  length?: number;
+  polyline?: { points?: [number, number][] };
+}
+interface RouterLeg {
+  steps?: RouterStep[];
+}
+interface RouterResponse {
+  errors?: string[];
+  route?: { legs?: RouterLeg[] };
+}
+
 function MapWithRoute({ address1, address2, mapState, onDistanceChange }: MapWithRouteProps) {
-  const ymaps = useYMaps(["multiRouter.MultiRoute"]);
+  const useProxy = Boolean(routerProxyUrl);
+  const ymaps = useYMaps(useProxy ? ["Polyline"] : ["multiRouter.MultiRoute"]);
   const mapRef = useRef<unknown>(null);
   const routeRef = useRef<unknown>(null);
 
@@ -36,8 +52,82 @@ function MapWithRoute({ address1, address2, mapState, onDistanceChange }: MapWit
     const map = mapRef.current as { geoObjects?: { add: (o: unknown) => void; remove: (o: unknown) => void } } | null;
     if (!address1 || !address2) return;
 
-    // If Yandex Maps script failed to load (often API key / referrer restrictions),
-    // we won't ever get routing events. Show a helpful message instead of hanging on "считаю…".
+    onDistanceChange(null);
+    if (routeRef.current) {
+      try {
+        map?.geoObjects?.remove(routeRef.current);
+      } catch {
+        // ignore
+      }
+      routeRef.current = null;
+    }
+
+    // —— Path 1: fetch route via proxy (avoids CORB), then draw Polyline ——
+    if (useProxy) {
+      if (!ymaps || !map?.geoObjects) {
+        const t = window.setTimeout(() => {
+          onDistanceChange("карта не загрузилась");
+        }, 2000);
+        return () => window.clearTimeout(t);
+      }
+      const waypoints = `${address1.coords[0]},${address1.coords[1]}|${address2.coords[0]},${address2.coords[1]}`;
+      const url = `${routerProxyUrl}?waypoints=${encodeURIComponent(waypoints)}&mode=driving`;
+      let cancelled = false;
+
+      fetch(url)
+        .then((r) => r.json())
+        .then((data: RouterResponse) => {
+          if (cancelled) return;
+          if (data.errors?.length) {
+            onDistanceChange(`ошибка: ${data.errors.join(", ")}`);
+            return;
+          }
+          const legs = data.route?.legs ?? [];
+          let totalMeters = 0;
+          const allPoints: [number, number][] = [];
+          for (const leg of legs) {
+            for (const step of leg.steps ?? []) {
+              if (typeof step.length === "number") totalMeters += step.length;
+              const pts = step.polyline?.points;
+              if (Array.isArray(pts)) allPoints.push(...pts);
+            }
+          }
+          if (totalMeters > 0) {
+            const km = totalMeters / 1000;
+            onDistanceChange(`${km.toFixed(1)} км`);
+          }
+          if (allPoints.length < 2 || cancelled) return;
+          if (!ymaps || !map?.geoObjects) return;
+          try {
+            const Polyline = (ymaps as any).Polyline;
+            if (!Polyline) return;
+            const polyline = new Polyline(
+              allPoints,
+              {},
+              { strokeColor: "#1e90ff", strokeWidth: 5 }
+            );
+            routeRef.current = polyline;
+            map.geoObjects.add(polyline);
+          } catch {
+            // ignore
+          }
+        })
+        .catch((err: Error) => {
+          if (!cancelled) onDistanceChange(`ошибка: ${err.message || "не удалось построить маршрут"}`);
+        });
+
+      return () => {
+        cancelled = true;
+        try {
+          if (routeRef.current && map?.geoObjects) map.geoObjects.remove(routeRef.current);
+        } catch {
+          // ignore
+        }
+        routeRef.current = null;
+      };
+    }
+
+    // —— Path 2: use JS API MultiRoute (can hit CORB on GH Pages) ——
     if (!ymaps || !map?.geoObjects) {
       const t = window.setTimeout(() => {
         onDistanceChange("карта/маршрутизация не загрузилась (проверьте API key и ограничения по referer)");
@@ -45,24 +135,12 @@ function MapWithRoute({ address1, address2, mapState, onDistanceChange }: MapWit
       return () => window.clearTimeout(t);
     }
 
-    onDistanceChange(null);
-    if (routeRef.current) {
-      try {
-        map.geoObjects.remove(routeRef.current);
-      } catch {
-        // ignore
-      }
-      routeRef.current = null;
-    }
-
     const multiRoute = new (ymaps as any).multiRouter.MultiRoute(
       {
         referencePoints: [address1.coords, address2.coords],
         params: { routingMode: "auto" },
       },
-      {
-        boundsAutoApply: true,
-      }
+      { boundsAutoApply: true }
     );
 
     routeRef.current = multiRoute;
@@ -74,18 +152,13 @@ function MapWithRoute({ address1, address2, mapState, onDistanceChange }: MapWit
         const dist: any =
           (active as any)?.properties?.get?.("distance") ??
           (multiRoute as any)?.getRoutes?.().get?.(0)?.properties?.get?.("distance");
-
         const text: unknown = dist?.text;
         if (typeof text === "string") {
           onDistanceChange(text);
           return;
         }
-
         const valueMeters: unknown = dist?.value;
-        if (typeof valueMeters === "number") {
-          const km = valueMeters / 1000;
-          onDistanceChange(`${km.toFixed(1)} км`);
-        }
+        if (typeof valueMeters === "number") onDistanceChange(`${(valueMeters / 1000).toFixed(1)} км`);
       } catch {
         // ignore
       }
@@ -94,12 +167,7 @@ function MapWithRoute({ address1, address2, mapState, onDistanceChange }: MapWit
     const onFail = () => {
       try {
         const err = (multiRoute as any)?.model?.getError?.();
-        const msg =
-          typeof err === "string"
-            ? err
-            : (err?.message as unknown) && typeof err.message === "string"
-              ? err.message
-              : null;
+        const msg = typeof err === "string" ? err : (err?.message as string) ?? null;
         onDistanceChange(msg ? `не удалось построить маршрут: ${msg}` : "не удалось построить маршрут");
       } catch {
         onDistanceChange("не удалось построить маршрут");
@@ -119,7 +187,7 @@ function MapWithRoute({ address1, address2, mapState, onDistanceChange }: MapWit
       }
       if (routeRef.current === multiRoute) routeRef.current = null;
     };
-  }, [ymaps, address1, address2, onDistanceChange]);
+  }, [ymaps, address1, address2, onDistanceChange, useProxy]);
 
   return (
     <Map

@@ -30,6 +30,7 @@ jobs:
       - run: npm run build
         env:
           VITE_YANDEX_API_KEY: ${{ secrets.VITE_YANDEX_API_KEY }}
+          VITE_ROUTER_PROXY_URL: ${{ vars.VITE_ROUTER_PROXY_URL }}
 
       - uses: actions/configure-pages@v5
 
