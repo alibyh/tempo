@@ -3,12 +3,13 @@
  * Set env var YANDEX_API_KEY in Vercel to your Yandex API key.
  * GET /api/route?waypoints=55.752,37.6175|59.9386,30.3141&mode=driving
  */
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   // Allow frontend origin (GH Pages, localhost, or any)
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
   if (req.method === "OPTIONS") {
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     return res.status(204).end();
   }
 
@@ -31,9 +32,22 @@ module.exports = async (req, res) => {
 
   try {
     const response = await fetch(url);
-    const data = await response.json();
+    const text = await response.text();
+    let data;
+
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = {
+        errors: ["Upstream did not return JSON"],
+        status: response.status,
+        body: text.slice(0, 500),
+      };
+    }
+
     res.status(response.ok ? 200 : response.status).json(data);
   } catch (e) {
-    res.status(502).json({ errors: [String(e.message || e)] });
+    const message = e instanceof Error ? e.message : String(e);
+    res.status(502).json({ errors: [message] });
   }
-};
+}
