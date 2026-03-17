@@ -34,7 +34,16 @@ function MapWithRoute({ address1, address2, mapState, onDistanceChange }: MapWit
 
   useEffect(() => {
     const map = mapRef.current as { geoObjects?: { add: (o: unknown) => void; remove: (o: unknown) => void } } | null;
-    if (!ymaps || !map?.geoObjects) return;
+    if (!address1 || !address2) return;
+
+    // If Yandex Maps script failed to load (often API key / referrer restrictions),
+    // we won't ever get routing events. Show a helpful message instead of hanging on "считаю…".
+    if (!ymaps || !map?.geoObjects) {
+      const t = window.setTimeout(() => {
+        onDistanceChange("карта/маршрутизация не загрузилась (проверьте API key и ограничения по referer)");
+      }, 1500);
+      return () => window.clearTimeout(t);
+    }
 
     onDistanceChange(null);
     if (routeRef.current) {
@@ -45,8 +54,6 @@ function MapWithRoute({ address1, address2, mapState, onDistanceChange }: MapWit
       }
       routeRef.current = null;
     }
-
-    if (!address1 || !address2) return;
 
     const multiRoute = new (ymaps as any).multiRouter.MultiRoute(
       {
@@ -85,7 +92,18 @@ function MapWithRoute({ address1, address2, mapState, onDistanceChange }: MapWit
     };
 
     const onFail = () => {
-      onDistanceChange("не удалось построить маршрут");
+      try {
+        const err = (multiRoute as any)?.model?.getError?.();
+        const msg =
+          typeof err === "string"
+            ? err
+            : (err?.message as unknown) && typeof err.message === "string"
+              ? err.message
+              : null;
+        onDistanceChange(msg ? `не удалось построить маршрут: ${msg}` : "не удалось построить маршрут");
+      } catch {
+        onDistanceChange("не удалось построить маршрут");
+      }
     };
 
     multiRoute.model.events.add("requestsuccess", onSuccess);
